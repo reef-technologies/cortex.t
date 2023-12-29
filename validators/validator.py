@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from itertools import tee
 import random
 import traceback
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from image_validator import ImageValidator
 from text_validator import TextValidator
+from envparse import env
 
 import template
 from template import utils
@@ -26,7 +28,10 @@ embed_vali = None
 metagraph = None
 wandb_runs = {}
 app = FastAPI()
-EXPECTED_ACCESS_KEY = "hello"
+# organic requests are scored, the tasks are stored in this queue
+# for later being consumed by `query_synapse` cycle:
+organic_scoring_tasks = []
+EXPECTED_ACCESS_KEY = env('EXPECTED_ACCESS_KEY', default='hello')
 
 
 def get_config() -> bt.config:
@@ -178,20 +183,21 @@ async def query_synapse(dendrite, subtensor, config, wallet):
     global metagraph
     steps_passed = 0
     total_scores = torch.zeros(len(metagraph.hotkeys))
+    iterations_per_set_weights = 12
+
     while True:
         try:
             metagraph = subtensor.metagraph(config.netuid)
-            available_uids = await get_available_uids(dendrite, metagraph)
 
-            if steps_passed % 5 in (0, 1, 2):
-                selected_validator = text_vali
+            if organic_scoring_tasks and organic_scoring_tasks[0].done():
+                scores, _uid_scores_dict, _wandb_data = organic_scoring_tasks.pop(0).result()
+                total_scores += scores
             else:
-                selected_validator = image_vali
+                available_uids = await get_available_uids(dendrite, metagraph)
+                selected_validator = text_vali if steps_passed % 5 in (0, 1, 2) else image_vali
+                scores, _uid_scores_dict = await process_modality(config, selected_validator, available_uids, metagraph)
+                total_scores += scores
 
-            scores, _uid_scores_dict = await process_modality(config, selected_validator, available_uids, metagraph)
-            total_scores += scores
-
-            iterations_per_set_weights = 12
             iterations_until_update = iterations_per_set_weights - ((steps_passed + 1) % iterations_per_set_weights)
             bt.logging.info(f"Updating weights in {iterations_until_update} iterations.")
 
@@ -213,16 +219,26 @@ async def process_text_validator(request: Request, data: dict) -> StreamingRespo
     if access_key != EXPECTED_ACCESS_KEY:
         raise HTTPException(status_code=401, detail="Invalid access key")
 
-    async def response_stream() -> AsyncIterator[str]:
+    messages_dict = {int(k): [{'role': 'user', 'content': v}] for k, v in data.items()}
+    # split organic results into two iterators - one for scoring, other for response
+    uid_to_content_for_scoring, uid_to_content_for_response = \
+        tee(text_vali.organic(metagraph, messages_dict), 2)
+
+    organic_scoring_tasks.append(asyncio.create_task(
+        text_vali.score_responses(
+            query_responses=dict(uid_to_content_for_scoring),
+            uid_to_question={int(k): v for k, v in data.items()},
+            metagraph=metagraph,
+        )
+    ))
+
+    async def response_stream(uid_to_content: AsyncIterator[tuple[int, str]]) -> AsyncIterator[str]:
         try:
-            messages_dict = {int(k): [{'role': 'user', 'content': v}] for k, v in data.items()}
-            async for response in text_vali.organic(metagraph, messages_dict):
-                _uid, content = response
-                yield f"{content}"
+            async for _, content in uid_to_content:
+                yield content
         except Exception:
             bt.logging.error(f"error in response_stream {traceback.format_exc()}")
-
-    return StreamingResponse(response_stream())
+    return StreamingResponse(response_stream(uid_to_content_for_response))
 
 def run_fastapi() -> None:
     uvicorn.run(app, host="0.0.0.0", port=8000)
